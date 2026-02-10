@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "OTFS vs OFDM in High-Mobility Channels (BSc Thesis, UMA 2025)"
+authors:
+  - family-names: "Macías Macías"
+    given-names: "Julio"
+year: 2025
+url: "https://github.com/TU_USUARIO/otfs-ofdm-high-mobility"
