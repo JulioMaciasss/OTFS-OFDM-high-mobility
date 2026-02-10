@@ -28,7 +28,7 @@ More detailed results depend on the specific Doppler spectrum/channel model (e.g
 - `results/` — optional output files (keep small; avoid large binaries)
 
 ## ⚙️ Requirements
-- MATLAB (tested with: TODO_MATLAB_VERSION)
+-MATLAB R2024b
 - Toolboxes:
   - For 3GPP TDL/CDL (`nrTDLChannel`, `nrCDLChannel`): **5G Toolbox** (or equivalent) is typically required (please confirm your setup).
 
