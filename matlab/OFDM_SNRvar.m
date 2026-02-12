@@ -1,3 +1,14 @@
+% ---- Load central config if available ----
+if exist("CFG","var")
+    M = CFG.M; N = CFG.N; df = CFG.df; fc = CFG.fc;
+    SNRdBvalues = CFG.SNRdBvalues; numbslots = CFG.numbslots;
+    modorder = CFG.modorder; idealCE = CFG.idealCE;
+    imagesturn = CFG.imagesturn; channelresponse = CFG.channelresponse;
+    padType = char(CFG.padType);
+end
+% ------------------------------------------
+
+
 % SIMULATION SETUP
 M = 64;          % Number of subcarriers
 N = 30;          % Number of subsymbols per frame
@@ -27,7 +38,7 @@ switch mod_order
 end
 
 % Definir el path base dinámicamente según la modulación
-basePath = fullfile('C:\Users\jm-y2\Desktop\TFG\SIMULACIONES', ['OFDM_3GHz_', modName]);
+basePath = CFG.out.results_dir;
 
 % Pilot generation and grid population
 pilotBin = floor(N/2)+1;
@@ -209,3 +220,4 @@ save(fullfile(folderName, 'resultados.mat'));
 
 % Mensaje de confirmación
 fprintf('Resultados guardados en: %s\n', folderName);
+
