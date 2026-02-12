@@ -1,124 +1,148 @@
-% SIMULATION SETUP
-M = 64;          % Number of subcarriers
-N = 30;          % Number of subsymbols per frame
-df = 15e3;       % LTE subcarrier spacing (15 kHz)
-fc = 5e9;        % Carrier frequency (5 GHz)
-padLen = 10;     % Number of padding samples, should be greater than channel dispersion
-padType = 'ZP';  % Zero Padding (ZP) to mitigate Inter-Symbol Interference (ISI)
-SNRdB_values = linspace(0, 20, 12);
-numb_slots = 100; % Number of slots, each slot contains 30 symbols
+% OFDM_validacion.m — OFDM validation (AWGN + optional Doppler channel)
+% Reproducible version (uses CFG when available), fixed BLER logic
 
-channel_type = 'awgn';
+clearvars -except CFG;
+close all; clc;
 
-% Pilot generation and grid population
-pilotBin = floor(N/2)+1;
-Pdd = zeros(M,N);
-Pdd(1,pilotBin) = exp(1i*pi/4); % populate just one bin to se
+%% Paths
+thisDir = fileparts(mfilename("fullpath"));
+addpath(fullfile(thisDir,"utils"));
 
-% Configure paths
-chanParams.pathDelays      = [0 5 8]; % num muestras de retraso 
-%al principio 0 estamos sincronizados con base, luego 5 muestras -3, se
-%aleja, luego 8 muestra se acerca 5 en doppler
-chanParams.pathGains       = [1  0.7 0.5]; % ganancia del camino 
-chanParams.pathDopplers    = [0  0  1 ]; % indices doppler(multiplos fsamp/MN)
+%% ---- Load central config if available ----
+if exist("CFG","var")
+    M = CFG.M; N = CFG.N; df = CFG.df; fc = CFG.fc; %#ok<NASGU>
+    padLen = CFG.padLen_default;
+    padType = char(CFG.padType);
 
-fsamp = M*df;            % freq muestreo M*df
-Meff = M + padLen;       % numero efect muestras por simb M+padlen(padding)
-numSamps = Meff * N;     % Num muestras por OTFS sub-simb incluye padding
-T = ((M+padLen)/(M*df)); % duracion del simbolo, Meff/numSamps
+    SNRdBvalues = CFG.SNRdBvalues;
+    numbslots  = CFG.numbslots;
 
-% Para calcular la freq doppler en hz
-chanParams.pathDopplerFreqs = chanParams.pathDopplers * 1/(N*T); % Hz
+    % Validation is AWGN by default
+    channel_type = "awgn";
 
-% Transmit pilots over all subcarriers and symbols to sound the channel
-txOut0 = ofdmmod(exp(1i*pi/4)*ones(M,N),M,padLen);       % transmit pilots over the entire grid
+    % If you want Doppler test inside validation, set this to true manually:
+    useDoppler = false;
 
-% Add white Gaussian noise
-Es = mean(abs(pskmod(0:3,4,pi/4).^ 2));
+    basePath = CFG.out.results_dir;
 
-berOFDM_values = zeros(size(SNRdB_values));
-blerOFDM_values = zeros(size(SNRdB_values));
-num_tx_bits = 2*M*N;
+    % Doppler params (only used if useDoppler==true)
+    chanParams.pathDelays   = CFG.doppler.pathDelays;
+    chanParams.pathGains    = CFG.doppler.pathGains;
+    chanParams.pathDopplers = CFG.doppler.pathDopplers;
+else
+    M = 64; N = 30; df = 15e3; fc = 3e9; %#ok<NASGU>
+    padLen = 10; padType = 'ZP';
 
-for i_snr=1:length(SNRdB_values)
-    SNRdB = SNRdB_values(i_snr);
-    n_errors = 0;
-    block_error = 0;
-    n_blk_errors = 0;
+    SNRdBvalues = linspace(0,20,12);
+    numbslots  = 100;
+
+    channel_type = "awgn";
+    useDoppler = false;
+
+    basePath = fullfile(pwd,"results");
+
+    chanParams.pathDelays   = [0 5 8];
+    chanParams.pathGains    = [1 0.7 0.5];
+    chanParams.pathDopplers = [0 0 1];
+end
+% ------------------------------------------
+
+%% Derived
+fsamp = M*df;
+Meff = M + padLen;
+numSamps = Meff * N; %#ok<NASGU>
+T = (M+padLen)/(M*df); %#ok<NASGU>
+
+chanParams.pathDopplerFreqs = chanParams.pathDopplers * (1/(N*T));
+
+%% Output folder
+folderName = fullfile(basePath, sprintf("OFDM_validation_%s_padLen%d", channel_type, padLen));
+if ~exist(folderName,'dir'); mkdir(folderName); end
+
+%% Pilot transmission (full grid pilot)
+P = exp(1i*pi/4);
+txOut0 = ofdmmod(P*ones(M,N), M, padLen);
+
+%% Energy / counters
+Es = computeSymbolEnergy(4); % QPSK reference energy
+numtxbits = 2*M*N;           % because QPSK => 2 bits/sym
+
+berOFDMvalues  = zeros(size(SNRdBvalues));
+blerOFDMvalues = zeros(size(SNRdBvalues));
+
+%% SNR loop
+for isnr = 1:length(SNRdBvalues)
+    SNRdB = SNRdBvalues(isnr);
+
+    nerrors = 0;
+    nblkerrors = 0;
+
     n0 = Es/(10^(SNRdB/10));
-    if ~strcmp(channel_type, 'awgn')
-        dopplerOut1 = dopplerChannel(txOut0,fsamp,chanParams);% send through channel
-        chOut = awgn(dopplerOut1,SNRdB,'measured');              % add noise
-        Yofdm = ofdmdemod(chOut(1:(M+padLen)*N),M,padLen);      % demodulate
-        Hofdm = Yofdm * conj(Pdd(1,pilotBin)) / (abs(Pdd(1,pilotBin))^2 + n0); % LMMSE channel estimate
-    end
-        for i_slot = 1:numb_slots
-            % Data generation
-            Xgrid = zeros(M,N);
-            Xdata = randi([0,1],2*M,N);
-            Xgrid(1:M,:) = pskmod(Xdata,4,pi/4,InputType="bit");
-        
-            % Transmit data over the same channel and use channel estimates to equalize
-            txOut = ofdmmod(Xgrid,M,padLen);                        % transmit data grid
-            
-            if ~strcmp(channel_type, 'awgn')
-                dopplerOut2 = dopplerChannel(txOut,fsamp,chanParams);    % send through channel
-            else
-                dopplerOut2 = txOut;
-            end
-            chOut = awgn(dopplerOut2,SNRdB,'measured');              % add noise
-            
-            rxWindow = chOut(1:(M+padLen)*N);
-            
-            if ~strcmp(channel_type, 'awgn')
-                Yofdm = ofdmdemod(rxWindow,M,padLen);                   % demodulate
-                Xhat_ofdm = conj(Hofdm) .* Yofdm ./ (abs(Hofdm).^2+n0); % equalize with LMMSE
-            else
-                Xhat_ofdm= ofdmdemod(rxWindow,M,padLen);
-            end
-            XhatDataOFDM = pskdemod(Xhat_ofdm,4,pi/4, ...
-                OutputType="bit",OutputDataType="logical");         % decode
-            bit_errors = xor(Xdata,XhatDataOFDM);
-            errores_ahora = sum(bit_errors(:));
-            % Cuentas errores y acumulas
-            n_errors = errores_ahora + n_errors;
-    
-            if(n_errors>0)
-                block_error = 1 ;% Si es erróneo
-            else
-                block_error = 0;
-            end
-    
-            n_blk_errors = n_blk_errors + block_error;
-        
-        end 
-    % Imprimir la BER después de completar todos los slots de una SNR
-    %fprintf('SNR = %2d dB -> BER = %.6f | BLER = %.6f | Errores: %d de %d bits\n', ...
-     %   SNRdB, berOTFS_values(i_snr), blerOTFS_values(i_snr), errores_ahora, num_tx_bits);
-    berOFDM_values(i_snr) = n_errors/(num_tx_bits*numb_slots);
-    blerOFDM_values(i_snr) = n_blk_errors/numb_slots;
 
+    % Channel estimate (only if using Doppler channel)
+    if useDoppler && channel_type ~= "awgn"
+        dopplerOut1 = dopplerChannel(txOut0, fsamp, chanParams);
+        chOutPilot  = awgn(dopplerOut1, SNRdB, 'measured');
+        Ypilot = ofdmdemod(chOutPilot(1:(M+padLen)*N), M, padLen);
+        Hofdm  = Ypilot * conj(P) / (abs(P)^2 + n0);
+    end
+
+    for islot = 1:numbslots
+        % Data generation (QPSK bits)
+        Xdata = randi([0,1], 2*M, N);
+        Xgrid = pskmod(Xdata, 4, pi/4, InputType="bit");
+
+        txOut = ofdmmod(Xgrid, M, padLen);
+
+        if useDoppler && channel_type ~= "awgn"
+            dopplerOut2 = dopplerChannel(txOut, fsamp, chanParams);
+        else
+            dopplerOut2 = txOut;
+        end
+
+        chOut = awgn(dopplerOut2, SNRdB, 'measured');
+        rxWindow = chOut(1:(M+padLen)*N);
+
+        if useDoppler && channel_type ~= "awgn"
+            Yofdm = ofdmdemod(rxWindow, M, padLen);
+            Xhat = conj(Hofdm).*Yofdm./(abs(Hofdm).^2 + n0);
+        else
+            Xhat = ofdmdemod(rxWindow, M, padLen);
+        end
+
+        XhatData = pskdemod(Xhat, 4, pi/4, OutputType="bit", OutputDataType="logical");
+
+        biterrors = xor(Xdata, XhatData);
+        erroresahora = sum(biterrors(:));
+
+        nerrors = nerrors + erroresahora;
+        nblkerrors = nblkerrors + (erroresahora > 0);
+    end
+
+    berOFDMvalues(isnr)  = nerrors/(numtxbits*numbslots);
+    blerOFDMvalues(isnr) = nblkerrors/numbslots;
 end
 
-% Reemplazar valores 0 por un número pequeño para evitar problemas con log
-berOFDM_values(berOFDM_values == 0) = 1e-10;
-blerOFDM_values(blerOFDM_values == 0) = 1e-10;
+%% Avoid log(0)
+berOFDMvalues(berOFDMvalues==0) = 1e-10;
+blerOFDMvalues(blerOFDMvalues==0) = 1e-10;
 
-% Graficar la BER contra los valores de SNR
-figure;
-semilogy(SNRdB_values, berOFDM_values, '-o', 'LineWidth', 2);
-xlabel('SNR (dB)');
-ylabel('BER');
-title('BER vs. SNR para OFDM');
-grid on;
-ylim([1e-4, 1]); % Ajusta los límites del eje Y (ejemplo)
+%% Plots + save
+fig1 = figure;
+semilogy(SNRdBvalues, berOFDMvalues, '-o', 'LineWidth', 2);
+xlabel('SNR (dB)'); ylabel('BER');
+title('OFDM validation — BER vs SNR');
+grid on; ylim([1e-4 1]);
+savefig(fig1, fullfile(folderName, 'BER_vs_SNR.fig'));
+exportgraphics(fig1, fullfile(folderName, 'BER_vs_SNR.png'));
 
-% Graficar la BLER contra los valores de SNR
-figure;
-semilogy(SNRdB_values, blerOFDM_values, '-o', 'LineWidth', 2);
-xlabel('SNR (dB)');
-ylabel('BLER');
-title('BLER vs. SNR para OFDM');
-grid on;
-ylim([1e-1, 1]); % Ajusta los límites del eje Y (ejemplo)
+fig2 = figure;
+semilogy(SNRdBvalues, blerOFDMvalues, '-o', 'LineWidth', 2);
+xlabel('SNR (dB)'); ylabel('BLER');
+title('OFDM validation — BLER vs SNR');
+grid on; ylim([1e-1 1]);
+savefig(fig2, fullfile(folderName, 'BLER_vs_SNR.fig'));
+exportgraphics(fig2, fullfile(folderName, 'BLER_vs_SNR.png'));
 
+save(fullfile(folderName, 'resultados.mat'));
+fprintf("Resultados guardados en: %s\n", folderName);
