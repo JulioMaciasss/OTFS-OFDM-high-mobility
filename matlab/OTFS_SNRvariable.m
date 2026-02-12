@@ -1,204 +1,202 @@
-% Definir el path base donde quieres guardar los resultados
-basePath = 'C:\Users\jm-y2\Desktop\TFG\SIMULACIONES\OTFS_3GHz';  % Cambia esta ruta según tu preferencia
+% OTFS_SNRvariable.m — OTFS over sparse delay–Doppler (custom dopplerChannel)
+% Reproducible version (uses CFG when available)
 
-%SIMULATION SET UP
-M = 64;          % num subportadoras
-N = 30;          % number of subsymb por trama
-df = 15e3;       % espaciado de freq LTE
-fc = 3e9;        % freq portadora
-padLen = 10;     % num muestras relleno, mayor q dispersion del canal
-padType = 'ZP';  % zero padding pa mitigar ISI
-SNRdB_values = linspace(0, 20, 12);
-numb_slots = 100; %cada slot 30 simb
-idealCE =  false;
-mod_order = 4; %2->BPSK, 4-> QPSK, 16-> 16-QAM, 64-> 64-QAM
-images_turn = false;
-channel_response = false;
+clearvars -except CFG;
+close all; clc;
 
+%% Paths
+thisDir = fileparts(mfilename("fullpath"));
+addpath(fullfile(thisDir,"utils"));
 
-% Pilot generation and grid population
+%% ---- Load central config if available ----
+if exist("CFG","var")
+    basePath = CFG.out.results_dir;
+
+    M = CFG.M; N = CFG.N; df = CFG.df; fc = CFG.fc; %#ok<NASGU>
+    padLen  = CFG.padLen_default;
+    padType = char(CFG.padType);
+
+    SNRdBvalues = CFG.SNRdBvalues;
+    numbslots  = CFG.numbslots;
+
+    idealCE = CFG.idealCE;
+    modorder = CFG.modorder;
+
+    imagesturn = CFG.imagesturn;
+    channelresponse = CFG.channelresponse;
+
+    threshold = CFG.beta;
+
+    % Doppler channel params
+    chanParams.pathDelays   = CFG.doppler.pathDelays;
+    chanParams.pathGains    = CFG.doppler.pathGains;
+    chanParams.pathDopplers = CFG.doppler.pathDopplers;
+else
+    basePath = fullfile(pwd,"results");
+
+    M = 64; N = 30; df = 15e3; fc = 3e9; %#ok<NASGU>
+    padLen = 10; padType = 'ZP';
+
+    SNRdBvalues = linspace(0,20,12);
+    numbslots = 100;
+
+    idealCE = false;
+    modorder = 4;
+
+    imagesturn = false;
+    channelresponse = false;
+
+    threshold = 0.05;
+
+    chanParams.pathDelays   = 0;
+    chanParams.pathGains    = 1;
+    chanParams.pathDopplers = -2;
+end
+% ------------------------------------------
+
+%% Derived
+fsamp = M*df;
+Meff = M + padLen;
+numSamps = Meff * N;
+T = (M+padLen)/(M*df); %#ok<NASGU>
+
+% For reference (Hz)
+chanParams.pathDopplerFreqs = chanParams.pathDopplers * (1/(N*T));
+
+%% Output folder
+dopplerStr = strjoin(string(chanParams.pathDopplers), "_");
+folderName = fullfile(basePath, sprintf("OTFS_Doppler_k%s_padLen%d_mod%d_beta%.4g", dopplerStr, padLen, modorder, threshold));
+if ~exist(folderName,'dir'); mkdir(folderName); end
+
+%% Pilot in delay–Doppler (single pilot)
 pilotBin = floor(N/2)+1;
 Pdd = zeros(M,N);
-Pdd(1,pilotBin) = exp(1i*pi/4); % populate just one bin to se
+Pdd(1,pilotBin) = exp(1i*pi/4);
 
-% OTFS modulation
-txOut0 = helperOTFSmod(Pdd,padLen,padType);
+txOut0 = helperOTFSmod(Pdd, padLen, padType);
 
-% Configure paths
-chanParams.pathDelays      = [0]; % number of samples that path is delayed
-chanParams.pathGains       = [1]; % complex path gain
-chanParams.pathDopplers    = [-2]; % Doppler index as a multiple of fsamp/MN
+%% Energy / counters
+Es = computeSymbolEnergy(modorder);
+numtxbits = log2(modorder)*M*N;
 
-% Convertir los valores del parámetro en una cadena de texto
-dopplerStr = strjoin(string(chanParams.pathDopplers), '_');  % Crear string separado por "_"
-% Concatenar la ruta manualmente con una barra invertida (Windows) o slash (Linux/Mac)
-folderName = strcat(basePath, '\OTFS_', dopplerStr);  % Para Windows
-% Convertir a char para evitar problemas con exist()
-folderName = char(folderName);  
-% Crear la carpeta si no existe
-if ~exist(folderName, 'dir')  
-    mkdir(folderName);
-end
+berOTFSvalues  = zeros(size(SNRdBvalues));
+blerOTFSvalues = zeros(size(SNRdBvalues));
 
-fsamp = M*df;            % freq muestreo M*df
-Meff = M + padLen;       % numero efect muestras por simb M+padlen(padding)
-numSamps = Meff * N;     % Num muestras por OTFS sub-simb incluye padding
-T = ((M+padLen)/(M*df)); % duracion del simbolo, Meff/numSamps
+%% SNR loop
+for isnr = 1:length(SNRdBvalues)
+    SNRdB = SNRdBvalues(isnr);
 
-% Para calcular la freq doppler en hz
-chanParams.pathDopplerFreqs = chanParams.pathDopplers * 1/(N*T); % Hz
+    nerrors = 0;
+    nblkerrors = 0;
 
-Es = computeSymbolEnergy(mod_order);
-
-num_tx_bits = log2(mod_order)*M*N;
-
-berOTFS_values = zeros(size(SNRdB_values));
-blerOTFS_values = zeros(size(SNRdB_values));
-
-
-for i_snr=1:length(SNRdB_values)
-    SNRdB=SNRdB_values(i_snr);
-    n_errors = 0;
-    block_error = 0;
-    n_blk_errors = 0;
     n0 = Es/(10^(SNRdB/10));
-    
-    %HAGO LA ESTIMACION DEL CANAL
-        dopplerOut1 = dopplerChannel(txOut0, fsamp, chanParams);
-        if idealCE
-            chOut = dopplerOut1;
-        else
-            chOut = awgn(dopplerOut1,SNRdB,'measured');
-        end
-        % Get a sample window
-        rxIn = chOut(1:numSamps);
-        %txOut es el canal, fsamp la freq de muestreo y chanParams los parametros
-        % OTFS demodulation
-        Ydd = helperOTFSdemod(rxIn,M,padLen,0,padType);
-        
-        % LMMSE channel estimate in the delay-Doppler 
-        
-        if idealCE
-            Hdd = Ydd * conj(Pdd(1,pilotBin)) / (abs(Pdd(1,pilotBin))^2);
-        else
-            Hdd = Ydd * conj(Pdd(1,pilotBin)) / (abs(Pdd(1,pilotBin))^2 + n0);
-        end
-        if channel_response && i_snr == 1
-            %GRAFICAR LA RE
-             figure;
-             xa = -N/2 : N/2 - 1;  % Eje Doppler centrado
-             ya = 0:1:M-1;
-             mesh(xa,ya,abs(Hdd));
-             view([-9.441 62.412]);
-             title('Delay-Doppler Channel Response H_{dd} from Channel Sounding');
-             xlabel('Normalized Doppler');
-             ylabel('Normalized Delay');
-             zlabel('Magnitude');
-             channel_response = false;
-        end
-        
-        %threshold = max(0.2, 0.1 * max(abs(Hdd(:)))); % Evita detectar ruido débil
-        [lp, vp] = find(abs(Hdd) >= 0.05);
-    
-        chanEst.pathGains = diag(Hdd(lp,vp));   % get path gains
-        chanEst.pathDelays = lp - 1;            % get delay indices
-        chanEst.pathDopplers = vp - pilotBin;   % get Doppler indices
 
-    for i_slot = 1:numb_slots
-        % Data generation -> GENERO BITS PARA TRANSMITIR
-        Xgrid = zeros(M,N);
-        Xdata = randi([0,1],log2(mod_order)*M,N);
-        Xgrid(1:M,:) = helperModulator(Xdata, mod_order);
-        
-        % OTFS modulation -> SEÑAL A TRANSMITIR 
-        txOut = helperOTFSmod(Xgrid,padLen,padType);
-        
-        % Add channel and noise -> METO CANAL Y AÑADO RUIDO
-        dopplerOut2 = dopplerChannel(txOut,fsamp,chanParams);
-        chOut = awgn(dopplerOut2,SNRdB,'measured');%dopplerout es la señal a la q añado
-            %ruido con la realcion señal ruido, y measured indica que debe calcular
-            %automente la potencia de la señal antes q el ruid
-        
-        % Form G matrix using channel estimates
-        G = getG(M,N,chanEst,padLen,padType);
-    
-        rxWindow = chOut(1:numSamps);
-        
-        %ESTIMO CON LMMSE 
-        y_otfs = ((G'*G)+n0*eye(Meff*N)) \ (G'*rxWindow); % LMMSE
-        
-        %DEMODULO Y DETECTO BITS 
-        Xhat_otfs = helperOTFSdemod(y_otfs,M,padLen,0,padType); % OTFS demodulation
-        %demod
-        XhatDataOTFS = helperDemodulator(Xhat_otfs,mod_order);
+    % ---- Channel estimation (pilot) ----
+    dopplerOut1 = dopplerChannel(txOut0, fsamp, chanParams);
 
-        bit_errors = xor(Xdata,XhatDataOTFS);
-        errores_ahora = sum(bit_errors(:));
-        % Cuentas errores y acumulas
-        n_errors = errores_ahora + n_errors;
-
-        if(n_errors>0)
-            block_error = 1 ;% Si es erróneo
-        else
-            block_error = 0;
-        end
-
-        n_blk_errors = n_blk_errors + block_error;
-        
-    end 
-    %Hago print del ultimo slot 
-    if images_turn && mod(i_snr,3)==0
-        % Crear constelación de referencia según mod_order
-        if mod_order == 2
-            refConst = pskmod(0:mod_order-1, mod_order, pi);
-        elseif mod_order == 4
-            refConst = pskmod(0:mod_order-1, mod_order, pi/4);
-        elseif mod_order == 16 || mod_order == 64
-            refConst = qammod(0:mod_order-1, mod_order);
-        else
-            error('Modulación no soportada para la constelación');
-        end
-
-        constDiagOTFS = comm.ConstellationDiagram( ...
-            'ReferenceConstellation', refConst, ...
-            'XLimits', [-2 2], ...
-            'YLimits', [-2 2], ...
-            'Title', 'OTFS');
-        subplot(2, 3, i_snr);
-        constDiagOTFS(Xhat_otfs(:));
-        title(['Simulación ' num2str()]); % Opcional: título para cada gráfico
+    if idealCE
+        chOutPilot = dopplerOut1;
+    else
+        chOutPilot = awgn(dopplerOut1, SNRdB, 'measured');
     end
 
-    berOTFS_values(i_snr) = n_errors/(num_tx_bits*numb_slots);
-    blerOTFS_values(i_snr) = n_blk_errors/numb_slots;
-       
+    rxIn = chOutPilot(1:numSamps);
+    Ydd = helperOTFSdemod(rxIn, M, padLen, 0, padType);
+
+    if idealCE
+        Hdd = Ydd * conj(Pdd(1,pilotBin)) / (abs(Pdd(1,pilotBin))^2);
+    else
+        Hdd = Ydd * conj(Pdd(1,pilotBin)) / (abs(Pdd(1,pilotBin))^2 + n0);
+    end
+
+    % Optional channel response plot (once)
+    if channelresponse && (isnr == 1)
+        figure;
+        xa = -N/2 : N/2 - 1;
+        ya = 0:M-1;
+        mesh(xa, ya, abs(Hdd));
+        view([-9.441 62.412]);
+        title('Delay-Doppler Channel Response H_{dd} from Channel Sounding');
+        xlabel('Normalized Doppler'); ylabel('Normalized Delay'); zlabel('Magnitude');
+        savefig(gcf, fullfile(folderName, 'hdd_channel_response.fig'));
+        exportgraphics(gcf, fullfile(folderName, 'hdd_channel_response.png'));
+    end
+
+    % Thresholding in delay–Doppler
+    [lp, vp] = find(abs(Hdd) >= threshold);
+
+    chanEst.pathGains    = diag(Hdd(lp,vp));
+    chanEst.pathDelays   = lp - 1;
+    chanEst.pathDopplers = vp - pilotBin;
+
+    % ---- Monte Carlo slots ----
+    for islot = 1:numbslots
+        % Data generation
+        Xdata = randi([0,1], log2(modorder)*M, N);
+        Xgrid = helperModulator(Xdata, modorder);
+
+        % OTFS modulation
+        txOut = helperOTFSmod(Xgrid, padLen, padType);
+
+        % Channel + noise
+        dopplerOut2 = dopplerChannel(txOut, fsamp, chanParams);
+        if idealCE
+            chOut = dopplerOut2;
+        else
+            chOut = awgn(dopplerOut2, SNRdB, 'measured');
+        end
+
+        % Form G matrix from estimates
+        G = getG(M, N, chanEst, padLen, padType);
+
+        rxWindow = chOut(1:numSamps);
+
+        % LMMSE equalization (time domain)
+        y_otfs = ((G'*G) + n0*eye(Meff*N)) \ (G' * rxWindow);
+
+        % OTFS demod + bit detect
+        Xhat_otfs = helperOTFSdemod(y_otfs, M, padLen, 0, padType);
+        XhatDataOTFS = helperDemodulator(Xhat_otfs, modorder);
+
+        % Error counting
+        biterrors = xor(Xdata, XhatDataOTFS);
+        erroresahora = sum(biterrors(:));
+
+        nerrors = nerrors + erroresahora;
+        nblkerrors = nblkerrors + (erroresahora > 0);
+
+        % Optional constellation
+        if imagesturn && mod(isnr,3)==0 && islot==numbslots
+            figure; plot(real(Xhat_otfs(:)), imag(Xhat_otfs(:)), '.'); grid on;
+            title(sprintf('OTFS constellation (SNR=%.1f dB)', SNRdB));
+        end
+    end
+
+    berOTFSvalues(isnr)  = nerrors/(numtxbits*numbslots);
+    blerOTFSvalues(isnr) = nblkerrors/numbslots;
 end
-% Reemplazar valores 0 por un número pequeño para evitar problemas con log
-berOTFS_values(berOTFS_values == 0) = 1e-10;
-blerOTFS_values(blerOTFS_values == 0) = 1e-10;
 
-% Graficar la BER contra los valores de SNR
-figure;
-semilogy(SNRdB_values, berOTFS_values, '-o', 'LineWidth', 2);
-xlabel('SNR (dB)');
-ylabel('BER');
-title('BER vs. SNR para OTFS');
-grid on;
-ylim([1e-4, 1]); % Ajusta los límites del eje Y (ejemplo)
-savefig(gcf, fullfile(folderName, 'BER_vs_SNR.fig'));  % Guarda en la carpeta creada
+%% Avoid log(0)
+berOTFSvalues(berOTFSvalues==0) = 1e-10;
+blerOTFSvalues(blerOTFSvalues==0) = 1e-10;
 
-% Graficar la BLER contra los valores de SNR
-figure;
-semilogy(SNRdB_values, blerOTFS_values, '-o', 'LineWidth', 2);
-xlabel('SNR (dB)');
-ylabel('BLER');
-title('BLER vs. SNR para OTFS');
-grid on;
-ylim([1e-1, 1]); % Ajusta los límites del eje Y (ejemplo)
-savefig(gcf, fullfile(folderName, 'BLER_vs_SNR.fig'));  % Guarda en la carpeta creada
+%% Plots + save
+fig1 = figure;
+semilogy(SNRdBvalues, berOTFSvalues, '-o', 'LineWidth', 2);
+xlabel('SNR (dB)'); ylabel('BER');
+title('OTFS — BER vs SNR (Sparse Doppler Channel)');
+grid on; ylim([1e-4 1]);
+savefig(fig1, fullfile(folderName, 'BER_vs_SNR.fig'));
+exportgraphics(fig1, fullfile(folderName, 'BER_vs_SNR.png'));
 
-% Guardar todas las variables en un archivo .mat dentro de la carpeta creada
+fig2 = figure;
+semilogy(SNRdBvalues, blerOTFSvalues, '-o', 'LineWidth', 2);
+xlabel('SNR (dB)'); ylabel('BLER');
+title('OTFS — BLER vs SNR (Sparse Doppler Channel)');
+grid on; ylim([1e-1 1]);
+savefig(fig2, fullfile(folderName, 'BLER_vs_SNR.fig'));
+exportgraphics(fig2, fullfile(folderName, 'BLER_vs_SNR.png'));
+
 save(fullfile(folderName, 'resultados.mat'));
 
-% Mensaje de confirmación
-fprintf('Resultados guardados en: %s\n', folderName);
+fprintf("Resultados guardados en: %s\n", folderName);
