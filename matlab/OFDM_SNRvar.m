@@ -1,223 +1,179 @@
-% ---- Load central config if available ----
+% OFDM_SNRvar.m — OFDM over sparse delay–Doppler (custom dopplerChannel)
+% Reproducible version (uses CFG when available)
+
+clearvars -except CFG;
+close all; clc;
+
+%% Paths
+thisDir = fileparts(mfilename("fullpath"));
+addpath(fullfile(thisDir,"utils"));
+
+%% ---- Load central config if available ----
 if exist("CFG","var")
-    M = CFG.M; N = CFG.N; df = CFG.df; fc = CFG.fc;
-    SNRdBvalues = CFG.SNRdBvalues; numbslots = CFG.numbslots;
-    modorder = CFG.modorder; idealCE = CFG.idealCE;
-    imagesturn = CFG.imagesturn; channelresponse = CFG.channelresponse;
+    basePath = CFG.out.results_dir;
+
+    M = CFG.M; N = CFG.N; df = CFG.df; fc = CFG.fc; %#ok<NASGU>
+    padLen = CFG.padLen_default;
     padType = char(CFG.padType);
+
+    SNRdBvalues = CFG.SNRdBvalues;
+    numbslots = CFG.numbslots;
+
+    idealCE = CFG.idealCE;
+    modorder = CFG.modorder;
+    imagesturn = CFG.imagesturn;
+    channelresponse = CFG.channelresponse;
+
+    % Doppler channel params
+    chanParams.pathDelays   = CFG.doppler.pathDelays;
+    chanParams.pathGains    = CFG.doppler.pathGains;
+    chanParams.pathDopplers = CFG.doppler.pathDopplers;
+else
+    basePath = fullfile(pwd,"results");
+
+    M = 64; N = 30; df = 15e3; fc = 3e9; %#ok<NASGU>
+    padLen = 10; padType = 'ZP';
+
+    SNRdBvalues = linspace(0,20,12);
+    numbslots = 100;
+
+    idealCE = true;
+    modorder = 4;
+
+    imagesturn = false;
+    channelresponse = false;
+
+    chanParams.pathDelays   = 0;
+    chanParams.pathGains    = 1;
+    chanParams.pathDopplers = -2;
 end
 % ------------------------------------------
 
+%% Derived
+fsamp = M*df;
+Meff = M + padLen;
+numSamps = Meff * N; %#ok<NASGU>
+T = (M+padLen)/(M*df); %#ok<NASGU>
 
-% SIMULATION SETUP
-M = 64;          % Number of subcarriers
-N = 30;          % Number of subsymbols per frame
-df = 15e3;       % LTE subcarrier spacing (15 kHz)
-fc = 3e9;        % Carrier frequency (5 GHz)
-padLen = 10;     % Number of padding samples, should be greater than channel dispersion
-padType = 'ZP';  % Zero Padding (ZP) to mitigate Inter-Symbol Interference (ISI)
-SNRdB_values = linspace(0, 20, 12);
-numb_slots = 100; % Number of slots, each slot contains 30 symbols
-idealCE = true;
-mod_order = 4; %2->BPSK, 4-> QPSK, 16-> 16-QAM, 64-> 64-QAM
-images_turn = false;
-channel_response = false;
+% For reference (Hz)
+chanParams.pathDopplerFreqs = chanParams.pathDopplers * (1/(N*T));
 
-% Crear sufijo de nombre según la modulación
-switch mod_order
-    case 2
-        modName = 'BPSK';
-    case 4
-        modName = 'QPSK';
-    case 16
-        modName = '16QAM';
-    case 64
-        modName = '64QAM';
-    otherwise
-        error('Unsupported modulation order: %d', mod_order);
-end
+%% Output folder
+dopplerStr = strjoin(string(chanParams.pathDopplers), "_");
+folderName = fullfile(basePath, sprintf("OFDM_Doppler_k%s_padLen%d_mod%d", dopplerStr, padLen, modorder));
+if ~exist(folderName,'dir'); mkdir(folderName); end
 
-% Definir el path base dinámicamente según la modulación
-basePath = CFG.out.results_dir;
+%% Pilot transmission (full grid pilot) + pilot symbol
+P = exp(1i*pi/4);
+txOut0 = ofdmmod(P*ones(M,N), M, padLen);
 
-% Pilot generation and grid population
-pilotBin = floor(N/2)+1;
-Pdd = zeros(M,N);
-Pdd(1,pilotBin) = exp(1i*pi/4); % populate just one bin to se
+%% Energy / counters
+Es = computeSymbolEnergy(modorder);
+numtxbits = log2(modorder)*M*N;
 
-% Configure paths
-chanParams.pathDelays      = 0; % number of samples that path is delayed
-chanParams.pathGains       = 1; % complex path gain
-chanParams.pathDopplers    = -2; % Doppler index as a multiple of fsamp/MN
+berOFDMvalues  = zeros(size(SNRdBvalues));
+blerOFDMvalues = zeros(size(SNRdBvalues));
 
-% Convertir los valores del parámetro en una cadena de texto
-dopplerStr = strjoin(string(chanParams.pathDopplers), '_');  % Crear string separado por "_"
-% Concatenar la ruta manualmente con una barra invertida (Windows) o slash (Linux/Mac)
-folderName = strcat(basePath, '\OFDM_', dopplerStr);  % Para Windows
-% Convertir a char para evitar problemas con exist()
-folderName = char(folderName);  
-% Crear la carpeta si no existe
-if ~exist(folderName, 'dir')  
-    mkdir(folderName);
-end
+%% SNR loop
+for isnr = 1:length(SNRdBvalues)
+    SNRdB = SNRdBvalues(isnr);
 
-fsamp = M*df;            % freq muestreo M*df
-Meff = M + padLen;       % numero efect muestras por simb M+padlen(padding)
-numSamps = Meff * N;     % Num muestras por OTFS sub-simb incluye padding
-T = ((M+padLen)/(M*df)); % duracion del simbolo, Meff/numSamps
+    nerrors = 0;
+    nblkerrors = 0;
 
-% Para calcular la freq doppler en hz
-chanParams.pathDopplerFreqs = chanParams.pathDopplers * 1/(N*T); % Hz
-
-% Transmit pilots over all subcarriers and symbols to sound the channel
-txOut0 = ofdmmod(exp(1i*pi/4)*ones(M,N),M,padLen);       % transmit pilots over the entire grid
-
-%Calculate the symbol energy
-Es = computeSymbolEnergy(mod_order);
-
-num_tx_bits = log2(mod_order)*M*N; %numb of tx bits
-
-berOFDM_values = zeros(size(SNRdB_values));
-blerOFDM_values = zeros(size(SNRdB_values));
-
-for i_snr=1:length(SNRdB_values)
-    SNRdB = SNRdB_values(i_snr);
-    n_errors = 0;
-    block_error = 0;
-    n_blk_errors = 0;
     n0 = Es/(10^(SNRdB/10));
-    
-    dopplerOut1 = dopplerChannel(txOut0,fsamp,chanParams);% send through channel
-     
+
+    % --- channel estimation (same channel for whole SNR point) ---
+    dopplerOut1 = dopplerChannel(txOut0, fsamp, chanParams);
+
     if idealCE
-        chOut = dopplerOut1;
+        chOutPilot = dopplerOut1;
     else
-        chOut = awgn(dopplerOut1,SNRdB,'measured');
+        chOutPilot = awgn(dopplerOut1, SNRdB, 'measured');
     end
 
-    Yofdm = ofdmdemod(chOut(1:(M+padLen)*N),M,padLen);      % demodulate
-    P = exp(1i*pi/4);  % el valor transmitido en toda la grilla
-    
-    if idealCE
-        Hofdm = Yofdm * conj(P) / (abs(P)^2);
-    else
-        Hofdm = Yofdm * conj(P) / (abs(P)^2 + n0);
-    end
-    
-    % % Para graficar la respuesta del canal, solo grafico el ultimo con
-    % bajo ruido
-    if channel_response && i_snr == length(SNRdB_values)
-        x = 1:M;  % Índices para las subportadoras (frecuencia Doppler)
-        y = 1:N;  % Índices para los símbolos (retardo)
+    Ypilot = ofdmdemod(chOutPilot(1:(M+padLen)*N), M, padLen);
 
-        % Visualización de la magnitud de Hofdm con ejes intercambiados
+    if idealCE
+        Hofdm = Ypilot * conj(P) / (abs(P)^2);
+    else
+        Hofdm = Ypilot * conj(P) / (abs(P)^2 + n0);
+    end
+
+    % Optional channel response plot (once)
+    if channelresponse && (isnr == length(SNRdBvalues))
         figure;
-        surf(y, x, abs(Hofdm));  % Se intercambian los ejes para representar H(t,f)
-
-        % Mejorar la visualización
-        shading interp;  % Interpolación para suavizar el color
-        colormap('jet');  % Usar un mapa de colores para mejorar el contraste
-        colorbar;  % Mostrar la barra de colores para la magnitud
-
-        % Etiquetas y título corregidos
-        xlabel('Time Index (t)');  % Representación del tiempo en el eje X
-        ylabel('Frequency Index (f)');  % Representación de la frecuencia en el eje Y
-        zlabel('Magnitude');
+        surf(1:N, 1:M, abs(Hofdm));
+        shading interp; colormap('jet'); colorbar;
+        xlabel('Time Index (t)'); ylabel('Frequency Index (f)'); zlabel('Magnitude');
         title('Channel Estimation H(t,f) - Direct Representation');
+        savefig(gcf, fullfile(folderName, 'channel_response.fig'));
+        exportgraphics(gcf, fullfile(folderName, 'channel_response.png'));
     end
-    
-        for i_slot = 1:numb_slots
-            % Data generation
-            Xgrid = zeros(M,N);
-            Xdata = randi([0,1],log2(mod_order)*M,N);
-            %modulo
-            Xgrid(1:M,:) = helperModulator(Xdata, mod_order);
-        
-            % Transmit data over the same channel and use channel estimates to equalize
-            txOut = ofdmmod(Xgrid,M,padLen);                        % transmit data grid
-            
-            dopplerOut2 = dopplerChannel(txOut,fsamp,chanParams);    % send through channel
-            chOut = awgn(dopplerOut2,SNRdB,'measured');              % add noise
-            
-            rxWindow = chOut(1:(M+padLen)*N);
-            Yofdm = ofdmdemod(rxWindow,M,padLen);                   % demodulate
-            if idealCE
-                Xhat_ofdm = conj(Hofdm) .* Yofdm ./ (abs(Hofdm).^2); % equalize with LMMSE
-            else
-                Xhat_ofdm = conj(Hofdm) .* Yofdm ./ (abs(Hofdm).^2+n0); % equalize with LMMSE
-            end
-            %demodulo
-            XhatDataOFDM = helperDemodulator(Xhat_ofdm, mod_order);
-            
-            bit_errors = xor(Xdata,XhatDataOFDM);
-            errores_ahora = sum(bit_errors(:));
-            % Cuentas errores y acumulas
-            n_errors = errores_ahora + n_errors;
-    
-            if(n_errors>0)
-                block_error = 1 ;% Si es erróneo
-            else
-                block_error = 0;
-            end
-    
-            n_blk_errors = n_blk_errors + block_error;
-        
-        end  
 
-        %Hago print del ultimo slot 
-        if images_turn && mod(i_snr,3)==0
-            % Crear constelación de referencia según mod_order
-            if mod_order == 2
-                refConst = pskmod(0:mod_order-1, mod_order, pi);
-            elseif mod_order == 4
-                refConst = pskmod(0:mod_order-1, mod_order, pi/4);
-            elseif mod_order == 16 || mod_order == 64
-                refConst = qammod(0:mod_order-1, mod_order);
-            else
-                error('Modulación no soportada para la constelación');
-            end
-            title_str = sprintf('OFDM, SNR = %.2f dB', SNRdB);
-            constDiagOFDM = comm.ConstellationDiagram( ...
-                'ReferenceConstellation', refConst, ...
-                'XLimits', [-2 2], ...
-                'YLimits', [-2 2],...
-                'Title',title_str);
-            
-            constDiagOFDM(Xhat_ofdm(:));
-            %saveas(gcf, fullfile(folderName, strcat(title_str, '.png')));  % Guarda en la carpeta creada
+    % --- Monte Carlo slots ---
+    for islot = 1:numbslots
+        Xdata = randi([0,1], log2(modorder)*M, N);
+        Xgrid = helperModulator(Xdata, modorder);
+
+        txOut = ofdmmod(Xgrid, M, padLen);
+
+        dopplerOut2 = dopplerChannel(txOut, fsamp, chanParams);
+
+        if idealCE
+            chOut = dopplerOut2;
+        else
+            chOut = awgn(dopplerOut2, SNRdB, 'measured');
         end
-    berOFDM_values(i_snr) = n_errors/(num_tx_bits*numb_slots);
-    blerOFDM_values(i_snr) = n_blk_errors/numb_slots;
 
+        rxWindow = chOut(1:(M+padLen)*N);
+        Yofdm = ofdmdemod(rxWindow, M, padLen);
+
+        if idealCE
+            Xhatofdm = conj(Hofdm).*Yofdm./(abs(Hofdm).^2);
+        else
+            Xhatofdm = conj(Hofdm).*Yofdm./(abs(Hofdm).^2 + n0);
+        end
+
+        XhatDataOFDM = helperDemodulator(Xhatofdm, modorder);
+
+        biterrors = xor(Xdata, XhatDataOFDM);
+        erroresahora = sum(biterrors(:));
+
+        nerrors = nerrors + erroresahora;
+        nblkerrors = nblkerrors + (erroresahora > 0);
+
+        if imagesturn && mod(isnr,3)==0 && islot==numbslots
+            figure; plot(real(Xhatofdm(:)), imag(Xhatofdm(:)), '.'); grid on;
+            title(sprintf('OFDM constellation (SNR=%.1f dB)', SNRdB));
+        end
+    end
+
+    berOFDMvalues(isnr)  = nerrors/(numtxbits*numbslots);
+    blerOFDMvalues(isnr) = nblkerrors/numbslots;
 end
 
-% Reemplazar valores 0 por un número pequeño para evitar problemas con log
-berOFDM_values(berOFDM_values == 0) = 1e-10;
-blerOFDM_values(blerOFDM_values == 0) = 1e-10;
+%% Avoid log(0)
+berOFDMvalues(berOFDMvalues==0) = 1e-10;
+blerOFDMvalues(blerOFDMvalues==0) = 1e-10;
 
-% Graficar la BER contra los valores de SNR
-figure;
-semilogy(SNRdB_values, berOFDM_values, '-o', 'LineWidth', 2);
-xlabel('SNR (dB)');
-ylabel('BER');
-title('BER vs. SNR para OFDM');
-grid on;
-ylim([1e-4, 1]); % Ajusta los límites del eje Y (ejemplo)
-savefig(gcf, fullfile(folderName, 'BER_vs_SNR.fig'));  % Guarda en la carpeta creada
+%% Plots + save
+fig1 = figure;
+semilogy(SNRdBvalues, berOFDMvalues, '-o', 'LineWidth', 2);
+xlabel('SNR (dB)'); ylabel('BER');
+title('OFDM — BER vs SNR (Sparse Doppler Channel)');
+grid on; ylim([1e-4 1]);
+savefig(fig1, fullfile(folderName, 'BER_vs_SNR.fig'));
+exportgraphics(fig1, fullfile(folderName, 'BER_vs_SNR.png'));
 
-% Graficar la BLER contra los valores de SNR
-figure;
-semilogy(SNRdB_values, blerOFDM_values, '-o', 'LineWidth', 2);
-xlabel('SNR (dB)');
-ylabel('BLER');
-title('BLER vs. SNR para OFDM');
-grid on;
-ylim([1e-1, 1]); % Ajusta los límites del eje Y (ejemplo)
-savefig(gcf, fullfile(folderName, 'BLER_vs_SNR.fig'));  % Guarda en la carpeta creada
+fig2 = figure;
+semilogy(SNRdBvalues, blerOFDMvalues, '-o', 'LineWidth', 2);
+xlabel('SNR (dB)'); ylabel('BLER');
+title('OFDM — BLER vs SNR (Sparse Doppler Channel)');
+grid on; ylim([1e-1 1]);
+savefig(fig2, fullfile(folderName, 'BLER_vs_SNR.fig'));
+exportgraphics(fig2, fullfile(folderName, 'BLER_vs_SNR.png'));
 
-% Guardar todas las variables en un archivo .mat dentro de la carpeta creada
 save(fullfile(folderName, 'resultados.mat'));
 
-% Mensaje de confirmación
-fprintf('Resultados guardados en: %s\n', folderName);
-
+fprintf("Resultados guardados en: %s\n", folderName);
